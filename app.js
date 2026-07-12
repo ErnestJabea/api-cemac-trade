@@ -47,6 +47,15 @@ app.register(rateLimit, {
     timeWindow: '1 minute'
 });
 
+app.get('/', async (request, reply) => {
+    return reply.type('text/html; charset=UTF-8').send('CEMAC Trade API is running');
+});
+
+app.get('/api/health', async () => ({
+    status: 'ok',
+    service: 'cemac-trade-api'
+}));
+
 // Routes
 app.register(require('./src/routes/auth'), { prefix: '/api/auth' });
 app.register(require('./src/routes/titres'), { prefix: '/api/titres' });
