@@ -15,13 +15,28 @@ app.decorate('io', null);
 
 // Environment variables
 const PORT = process.env.PORT || 3000;
-const FRONTEND_URLS = (process.env.FRONTEND_URL || 'http://localhost:5173,http://127.0.0.1:5173')
+const DEFAULT_FRONTEND_URLS = [
+    'https://cemac-trade.koriassetmanagement.com',
+    'https://cemac-trade.e-jabbing.net',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+];
+const normalizeOrigin = (value) => {
+    if (!value) return '';
+    try {
+        return new URL(value).origin;
+    } catch {
+        return String(value).trim().replace(/\/+$/, '');
+    }
+};
+const FRONTEND_URLS = (process.env.FRONTEND_URL || DEFAULT_FRONTEND_URLS.join(','))
     .split(',')
-    .map((origin) => origin.trim())
+    .map(normalizeOrigin)
     .filter(Boolean);
 
 const corsOrigin = (origin, cb) => {
-    if (!origin || FRONTEND_URLS.includes(origin)) {
+    const normalizedOrigin = normalizeOrigin(origin);
+    if (!origin || FRONTEND_URLS.includes(normalizedOrigin)) {
         cb(null, true);
         return;
     }
