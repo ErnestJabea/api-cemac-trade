@@ -51,10 +51,13 @@ app.get('/', async (request, reply) => {
     return reply.type('text/html; charset=UTF-8').send('CEMAC Trade API is running');
 });
 
-app.get('/api/health', async () => ({
+const healthResponse = {
     status: 'ok',
     service: 'cemac-trade-api'
-}));
+};
+
+app.get('/health', async () => healthResponse);
+app.get('/api/health', async () => healthResponse);
 
 // Routes
 app.register(require('./src/routes/auth'), { prefix: '/api/auth' });
