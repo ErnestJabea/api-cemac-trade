@@ -359,6 +359,26 @@ const run = async () => {
     state.intruderToken = intruderLogin.token;
     state.adminToken = adminLogin.token;
 
+    const buyerProfile = await request('/auth/me', { headers: authHeaders(state.buyerToken) });
+    assert(buyerProfile.res.ok && buyerProfile.data.email === users.buyer.email, 'Lecture profil utilisateur');
+
+    const updatedBuyerPhone = '+237699999999';
+    const updatedBuyerProfile = await request('/auth/me', {
+        method: 'PUT',
+        headers: authHeaders(state.buyerToken),
+        body: JSON.stringify({
+            nom: users.buyer.nom,
+            prenom: users.buyer.prenom,
+            telephone: updatedBuyerPhone,
+            pseudo_anonyme: users.buyer.pseudo_anonyme,
+            wallet_ref: `UPDATED-WALLET-${TEST_RUN_ID}`
+        })
+    });
+    assert(
+        updatedBuyerProfile.res.ok && updatedBuyerProfile.data.profile.telephone === updatedBuyerPhone,
+        'Mise a jour profil utilisateur'
+    );
+
     let uploaded = await uploadTitre(state.sellerToken, state.titreCode, 100, 10000);
     assert(uploaded.res.ok && uploaded.data.total_imported === 1, 'Import Excel titre vendeur', JSON.stringify(uploaded.data));
 
@@ -411,6 +431,26 @@ const run = async () => {
 
     const sortedIds = [state.buyerId, state.sellerId].sort();
     state.roomId = `${state.tradeId}_${sortedIds[0]}_${sortedIds[1]}`;
+
+    const interest = await request(`/trades/${state.tradeId}/interest`, {
+        method: 'POST',
+        headers: authHeaders(state.buyerToken)
+    });
+    assert(interest.res.status === 201 && interest.data.notified === true, 'Interet acheteur notifie au vendeur');
+
+    const sellerInterestNotification = await Notification.findOne({
+        where: { user_id: state.sellerId, type: 'Interet Offre' }
+    });
+    assert(Boolean(sellerInterestNotification), 'Notification interet visible pour vendeur');
+
+    const duplicateInterest = await request(`/trades/${state.tradeId}/interest`, {
+        method: 'POST',
+        headers: authHeaders(state.buyerToken)
+    });
+    assert(
+        duplicateInterest.res.ok && duplicateInterest.data.notified === false,
+        'Interet acheteur non duplique'
+    );
 
     const intruderMessages = await request(`/messages/${state.roomId}`, { headers: authHeaders(state.intruderToken) });
     assert(intruderMessages.res.status === 403, 'Intrus refusé sur conversation', `status=${intruderMessages.res.status}`);

@@ -17,9 +17,12 @@ app.decorate('io', null);
 const PORT = process.env.PORT || 3000;
 const DEFAULT_FRONTEND_URLS = [
     'https://cemac-trade.koriassetmanagement.com',
+    'https://www.cemac-trade.koriassetmanagement.com',
     'https://cemac-trade.e-jabbing.net',
     'http://localhost:5173',
-    'http://127.0.0.1:5173'
+    'http://127.0.0.1:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174'
 ];
 const normalizeOrigin = (value) => {
     if (!value) return '';
@@ -29,10 +32,16 @@ const normalizeOrigin = (value) => {
         return String(value).trim().replace(/\/+$/, '');
     }
 };
-const FRONTEND_URLS = (process.env.FRONTEND_URL || DEFAULT_FRONTEND_URLS.join(','))
+const parseOrigins = (value) => String(value || '')
     .split(',')
     .map(normalizeOrigin)
     .filter(Boolean);
+
+const FRONTEND_URLS = Array.from(new Set([
+    ...DEFAULT_FRONTEND_URLS.map(normalizeOrigin),
+    ...parseOrigins(process.env.FRONTEND_URL),
+    ...parseOrigins(process.env.FRONTEND_ORIGINS)
+]));
 
 const corsOrigin = (origin, cb) => {
     const normalizedOrigin = normalizeOrigin(origin);
@@ -41,7 +50,7 @@ const corsOrigin = (origin, cb) => {
         return;
     }
 
-    cb(new Error('Origin not allowed by CORS'), false);
+    cb(null, false);
 };
 
 // Plugins
@@ -106,7 +115,7 @@ const start = async () => {
         const io = socketIo(app.server, {
             path: '/api/socket.io',
             cors: {
-                origin: FRONTEND_URLS,
+                origin: corsOrigin,
                 methods: ['GET', 'POST']
             }
         });

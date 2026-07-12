@@ -17,10 +17,35 @@ const isMfaEnabledForUser = (user) => {
 
 const sanitizeUser = (user) => ({
     id: user.id,
+    nom: user.nom,
+    prenom: user.prenom,
+    email: user.email,
+    telephone: user.telephone,
+    pseudo_anonyme: user.pseudo_anonyme,
+    wallet_ref: user.wallet_ref,
     public_identity: { pseudo_anonyme: user.pseudo_anonyme },
     role: user.role,
     mfa_enabled: isMfaEnabledForUser(user)
 });
+
+const sanitizeProfile = (user) => ({
+    id: user.id,
+    nom: user.nom,
+    prenom: user.prenom,
+    email: user.email,
+    telephone: user.telephone,
+    pseudo_anonyme: user.pseudo_anonyme,
+    wallet_ref: user.wallet_ref,
+    role: user.role,
+    is_verified: Boolean(user.is_verified),
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt
+});
+
+const cleanProfileField = (value, maxLength = 120) => {
+    if (value === undefined || value === null) return '';
+    return String(value).replace(/\s+/g, ' ').trim().slice(0, maxLength);
+};
 
 const createAccessToken = (user) => jwt.sign(
     { id: user.id, role: user.role, pseudo: user.pseudo_anonyme, purpose: 'access' },
@@ -40,7 +65,12 @@ const verifyCurrentPassword = async (user, currentPassword) => {
 };
 
 const getFrontendBaseUrl = () => {
-    return String(process.env.FRONTEND_URL || 'https://cemac-trade.e-jabbing.net')
+    return String(
+        process.env.APP_PUBLIC_URL ||
+        process.env.PUBLIC_FRONTEND_URL ||
+        process.env.FRONTEND_URL ||
+        'https://cemac-trade.koriassetmanagement.com'
+    )
         .split(',')
         .map((url) => url.trim())
         .filter(Boolean)[0];
@@ -287,6 +317,64 @@ module.exports = async function (fastify, opts) {
 
             return reply.send({
                 token: createAccessToken(user),
+                user: sanitizeUser(user)
+            });
+        } catch (error) {
+            fastify.log.error(error);
+            return reply.code(500).send({ error: 'Erreur interne du serveur' });
+        }
+    });
+
+    fastify.get('/me', { preHandler: authMiddleware }, async (request, reply) => {
+        try {
+            const user = await User.findByPk(request.user.id);
+            if (!user) return reply.code(404).send({ error: 'Utilisateur introuvable' });
+
+            return reply.send(sanitizeProfile(user));
+        } catch (error) {
+            fastify.log.error(error);
+            return reply.code(500).send({ error: 'Erreur interne du serveur' });
+        }
+    });
+
+    fastify.put('/me', { preHandler: authMiddleware }, async (request, reply) => {
+        try {
+            const user = await User.findByPk(request.user.id);
+            if (!user) return reply.code(404).send({ error: 'Utilisateur introuvable' });
+
+            const nom = cleanProfileField(request.body?.nom, 80);
+            const prenom = cleanProfileField(request.body?.prenom, 80);
+            const telephone = cleanProfileField(request.body?.telephone, 40);
+            const pseudoAnonyme = cleanProfileField(request.body?.pseudo_anonyme, 80);
+            const walletRef = cleanProfileField(request.body?.wallet_ref, 120);
+
+            if (!nom || !prenom || !telephone || !pseudoAnonyme) {
+                return reply.code(400).send({ error: 'Nom, prenom, telephone et pseudo public sont requis' });
+            }
+
+            if (pseudoAnonyme !== user.pseudo_anonyme) {
+                const existingPseudo = await User.findOne({
+                    where: {
+                        pseudo_anonyme: pseudoAnonyme,
+                        id: { [Op.ne]: user.id }
+                    }
+                });
+
+                if (existingPseudo) {
+                    return reply.code(400).send({ error: 'Ce pseudo public est deja utilise' });
+                }
+            }
+
+            user.nom = nom;
+            user.prenom = prenom;
+            user.telephone = telephone;
+            user.pseudo_anonyme = pseudoAnonyme;
+            user.wallet_ref = walletRef || null;
+            await user.save();
+
+            return reply.send({
+                message: 'Profil mis a jour avec succes',
+                profile: sanitizeProfile(user),
                 user: sanitizeUser(user)
             });
         } catch (error) {

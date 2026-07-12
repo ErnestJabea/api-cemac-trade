@@ -1,8 +1,8 @@
-const { Trade, User, Titre, Message } = require('../models/index');
+const { Trade, User, Titre, Message, Notification } = require('../models/index');
 const { authMiddleware, adminMiddleware } = require('../middlewares/authMiddleware');
 const { sendMail } = require('../utils/mailer');
 const { Op } = require('sequelize');
-const { parseRoomId } = require('../utils/conversations');
+const { canonicalRoomId, parseRoomId } = require('../utils/conversations');
 const { createNotificationsForUsers } = require('../services/notificationService');
 
 const VALID_TRADE_STATUSES = new Set(['Brouillon', 'Publié', 'Désactivé', 'Vendu', 'Acheté', 'Archivé', 'En cours de négociation']);
@@ -17,6 +17,57 @@ const toValidPercentage = (value) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 && parsed <= 200 ? parsed : null;
 };
+
+const normalizeStatus = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const isNegotiableStatus = (status) => {
+    const normalized = normalizeStatus(status);
+    const rawStatus = String(status || '');
+    return normalized === 'publie'
+        || normalized === 'en cours de negociation'
+        || rawStatus === 'PubliÃ©'
+        || rawStatus === 'En cours de nÃ©gociation';
+};
+
+const formatNumber = (value) => Number(value || 0).toLocaleString('fr-FR');
+const formatXaf = (value) => `${formatNumber(value)} XAF`;
+
+const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+
+const buildTradeEmailDetails = (trade) => {
+    const title = trade?.titre_id || 'Titre non precise';
+    const quantity = formatNumber(trade?.quantite);
+    const price = trade?.prix_pourcentage !== undefined && trade?.prix_pourcentage !== null
+        ? `${Number(trade.prix_pourcentage).toLocaleString('fr-FR')}%`
+        : 'Non precise';
+    const amount = formatXaf(trade?.montant);
+    const titre = trade?.titre;
+    const instrument = titre
+        ? `${titre.nature || 'Titre'} | ${titre.emetteur || 'Emetteur non precise'} | ${titre.taux_facial || 'Taux non precise'}`
+        : '';
+
+    return { title, quantity, price, amount, instrument };
+};
+
+const buildTradeDetailsHtml = (details) => `
+    <ul>
+        <li><strong>Titre :</strong> ${escapeHtml(details.title)}</li>
+        <li><strong>Quantite :</strong> ${escapeHtml(details.quantity)}</li>
+        <li><strong>Prix :</strong> ${escapeHtml(details.price)}</li>
+        <li><strong>Volume nominal :</strong> ${escapeHtml(details.amount)}</li>
+        ${details.instrument ? `<li><strong>Sous-jacent :</strong> ${escapeHtml(details.instrument)}</li>` : ''}
+    </ul>
+`;
 
 module.exports = async function (fastify, opts) {
     // List all PUBLIC trades (Visible to everyone) - No auth required
@@ -138,6 +189,104 @@ module.exports = async function (fastify, opts) {
             }));
 
             return reply.send(formatted);
+        } catch (error) {
+            fastify.log.error(error);
+            return reply.code(500).send({ error: 'Erreur interne du serveur' });
+        }
+    });
+
+    // Buyer: signal interest in a public offer before opening a negotiation room.
+    fastify.post('/:id/interest', { preHandler: authMiddleware }, async (request, reply) => {
+        try {
+            const trade = await Trade.findByPk(request.params.id, {
+                include: [
+                    { model: User, as: 'author', attributes: ['id', 'pseudo_anonyme', 'email'] },
+                    { model: Titre, as: 'titre' }
+                ]
+            });
+
+            if (!trade) {
+                return reply.code(404).send({ error: 'Annonce introuvable' });
+            }
+
+            if (!isNegotiableStatus(trade.statut)) {
+                return reply.code(400).send({ error: 'Cette annonce ne peut pas recevoir de nouvel interet' });
+            }
+
+            const buyer = await User.findByPk(request.user.id, {
+                attributes: ['id', 'pseudo_anonyme', 'email']
+            });
+            if (!buyer) return reply.code(404).send({ error: 'Utilisateur introuvable' });
+
+            if (String(trade.author_id) === String(buyer.id)) {
+                return reply.code(400).send({ error: 'Vous ne pouvez pas manifester un interet sur votre propre annonce' });
+            }
+
+            const roomId = canonicalRoomId(trade.id, buyer.id, trade.author_id);
+            const existingConversation = await Message.count({
+                where: {
+                    sender_id: buyer.id,
+                    [Op.or]: [
+                        { room_id: roomId },
+                        { room_id: { [Op.like]: `${trade.id}_%` } },
+                        { room_id: { [Op.like]: `trade_${trade.id}_%` } }
+                    ]
+                }
+            });
+
+            const details = buildTradeEmailDetails(trade);
+            const notificationMessage = `${buyer.pseudo_anonyme} manifeste un interet pour ${details.title} - Qte ${details.quantity} a ${details.price}.`;
+            const existingInterest = await Notification.count({
+                where: {
+                    user_id: trade.author_id,
+                    type: 'Interet Offre',
+                    message: notificationMessage
+                }
+            });
+
+            if (existingConversation > 0 || existingInterest > 0) {
+                return reply.send({ success: true, notified: false, room_id: roomId });
+            }
+
+            const notifications = await createNotificationsForUsers({
+                userIds: [trade.author_id],
+                message: notificationMessage,
+                type: 'Interet Offre',
+                pushTitle: 'Nouvel interet',
+                pushBody: notificationMessage,
+                pushTag: `trade-${trade.id}-interest-${buyer.id}`,
+                url: `/chat/${encodeURIComponent(roomId)}`,
+                logger: fastify.log
+            });
+
+            notifications.forEach((notification) => {
+                fastify.io?.to(`user:${notification.user_id}`).emit('notification_created', notification.toJSON());
+            });
+
+            const detailsHtml = buildTradeDetailsHtml(details);
+            const sellerHtml = `
+                <h2>Nouvel interet sur votre offre</h2>
+                <p>Bonjour ${escapeHtml(trade.author?.pseudo_anonyme || 'Asset Manager')},</p>
+                <p>${escapeHtml(buyer.pseudo_anonyme)} souhaite negocier votre annonce.</p>
+                ${detailsHtml}
+                <p>Connectez-vous a CEMAC Trade pour poursuivre la discussion.</p>
+            `;
+            const buyerHtml = `
+                <h2>Demande de negociation enregistree</h2>
+                <p>Bonjour ${escapeHtml(buyer.pseudo_anonyme)},</p>
+                <p>Votre interet a ete transmis au vendeur.</p>
+                ${detailsHtml}
+                <p>Vous pouvez poursuivre l'echange depuis le chat securise.</p>
+            `;
+
+            Promise.all([
+                sendMail(trade.author.email, 'CEMAC Trade - Nouvel interet sur votre offre', sellerHtml)
+                    .catch((mailError) => fastify.log.error(mailError)),
+                sendMail(buyer.email, 'CEMAC Trade - Demande de negociation enregistree', buyerHtml)
+                    .catch((mailError) => fastify.log.error(mailError))
+            ]).catch((mailError) => fastify.log.error(mailError));
+
+            return reply.code(201).send({ success: true, notified: true, room_id: roomId });
         } catch (error) {
             fastify.log.error(error);
             return reply.code(500).send({ error: 'Erreur interne du serveur' });
@@ -310,14 +459,31 @@ module.exports = async function (fastify, opts) {
                                 fastify.io?.to(`user:${notification.user_id}`).emit('notification_created', notification.toJSON());
                             });
 
+                            const seller = await User.findByPk(request.user.id, {
+                                attributes: ['id', 'pseudo_anonyme', 'email']
+                            });
+                            const details = buildTradeEmailDetails(trade);
+                            const detailsHtml = buildTradeDetailsHtml(details);
                             const mailHtml = `
                                 <h2>Offre Conclue</h2>
-                                <p>Bonjour ${buyer.pseudo_anonyme},</p>
-                                <p>L'annonce pour le titre <strong>${trade.titre_id}</strong> vient de vous être vendue par l'Asset Manager au prix de <strong>${trade.prix_pourcentage}%</strong>.</p>
+                                <p>Bonjour ${escapeHtml(buyer.pseudo_anonyme)},</p>
+                                <p>L'annonce pour le titre <strong>${escapeHtml(details.title)}</strong> vient de vous etre vendue par l'Asset Manager.</p>
+                                ${detailsHtml}
                                 <p>Veuillez vous connecter pour finaliser ou consulter votre tableau de bord.</p>
                             `;
-                            await sendMail(buyer.email, 'CEMAC Trade - Offre Vendu', mailHtml)
+                            sendMail(buyer.email, 'CEMAC Trade - Offre Vendu', mailHtml)
                                 .catch((mailError) => fastify.log.error(mailError));
+
+                            if (seller?.email) {
+                                const sellerMailHtml = `
+                                    <h2>Vente confirmee</h2>
+                                    <p>Bonjour ${escapeHtml(seller.pseudo_anonyme)},</p>
+                                    <p>Votre vente a ete attribuee a <strong>${escapeHtml(buyer.pseudo_anonyme)}</strong> (${escapeHtml(buyer.email)}).</p>
+                                    ${detailsHtml}
+                                `;
+                                sendMail(seller.email, 'CEMAC Trade - Vente confirmee', sellerMailHtml)
+                                    .catch((mailError) => fastify.log.error(mailError));
+                            }
                         }
                     } else {
                          trade.buyer_id = null; // Vendu hors plateforme
